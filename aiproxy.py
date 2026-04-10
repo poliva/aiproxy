@@ -56,6 +56,184 @@ def _read_json_body(body_bytes: bytes | None) -> dict | None:
         return None
 
 
+def _messages_from_responses_input(inp):
+    """Turn Responses-API-style `input` into OpenAI chat `messages` (list of dicts)."""
+    if isinstance(inp, str):
+        return [{"role": "user", "content": inp}]
+    if isinstance(inp, dict):
+        if inp.get("role") and "content" in inp:
+            return [dict(inp)]
+        if inp.get("type") == "message" and inp.get("role"):
+            return [{"role": inp["role"], "content": inp.get("content", "")}]
+        return [{"role": "user", "content": inp}]
+    if isinstance(inp, list):
+        if not inp:
+            return []
+        if all(isinstance(x, dict) and x.get("role") for x in inp):
+            return [dict(x) for x in inp]
+        parts = []
+        for x in inp:
+            if not isinstance(x, dict):
+                parts.append({"type": "text", "text": str(x)})
+                continue
+            t = x.get("type", "")
+            if t in ("input_text", "text"):
+                parts.append({"type": "text", "text": x.get("text", "")})
+            elif t == "message" and x.get("role"):
+                return [{"role": x["role"], "content": x.get("content", "")}]
+            elif t == "input_image" or x.get("image_url") is not None:
+                iu = x.get("image_url")
+                if isinstance(iu, str):
+                    parts.append({"type": "image_url", "image_url": {"url": iu}})
+                elif isinstance(iu, dict):
+                    parts.append({"type": "image_url", "image_url": iu})
+            else:
+                parts.append({"type": "text", "text": x.get("text", json.dumps(x))})
+        if not parts:
+            return []
+        if len(parts) == 1 and parts[0].get("type") == "text":
+            return [{"role": "user", "content": parts[0].get("text", "")}]
+        return [{"role": "user", "content": parts}]
+    return [{"role": "user", "content": str(inp)}]
+
+
+def _openai_messages_from_body(body: dict) -> list:
+    """Prefer `messages`; if missing or empty, build from Responses-style `input`."""
+    raw = body.get("messages")
+    if isinstance(raw, list) and len(raw) > 0:
+        return raw
+    inp = body.get("input")
+    if inp is None:
+        return []
+    return _messages_from_responses_input(inp)
+
+
+def _messages_list_for_chat(body: dict, coerce_input_to_messages: bool) -> list:
+    """Message list for chat transforms: optional coercion from `input` when `coerce_input_to_messages` is True."""
+    if coerce_input_to_messages:
+        return _openai_messages_from_body(body)
+    m = body.get("messages")
+    return m if isinstance(m, list) else []
+
+
+def _tool_function_name(fn: dict | None, tool: dict | None = None) -> str | None:
+    """Resolve function name from nested `function` and/or top-level tool fields (Cursor / Responses variants)."""
+    if isinstance(fn, dict):
+        n = fn.get("name")
+        if isinstance(n, str) and n.strip():
+            return n.strip()
+        if n is not None and not isinstance(n, str):
+            s = str(n).strip()
+            if s:
+                return s
+    if isinstance(tool, dict):
+        n = tool.get("name")
+        if isinstance(n, str) and n.strip():
+            return n.strip()
+    return None
+
+
+def _normalize_chat_tool_definition(t: dict) -> dict | None:
+    """
+    Canonical OpenAI chat shape: {"type": "function", "function": {"name", "description", "parameters"}}.
+    Cursor may send type "custom"; Minimax rejects that (invalid tool type: custom). We merge optional
+    `custom` payload and always emit type "function". Drops entries only if no name can be resolved.
+    """
+    if not isinstance(t, dict):
+        return None
+    t = dict(t)
+    typ_in = t.get("type") or "function"
+    if isinstance(typ_in, str) and typ_in.lower() == "custom":
+        cust = t.get("custom")
+        if isinstance(cust, dict):
+            t = {**cust, **{k: v for k, v in t.items() if k != "custom"}}
+        t["type"] = "function"
+    fn = t.get("function") if isinstance(t.get("function"), dict) else None
+    name = _tool_function_name(fn, t)
+    if not name:
+        return None
+    if fn:
+        fn_out = dict(fn)
+        fn_out["name"] = name
+        if fn_out.get("parameters") is None:
+            fn_out["parameters"] = {}
+        desc = fn_out.get("description")
+        if desc is None and isinstance(t.get("description"), str):
+            fn_out["description"] = t["description"]
+    else:
+        params = t.get("parameters")
+        fn_out = {
+            "name": name,
+            "description": (t.get("description") or "") if isinstance(t.get("description"), str) else "",
+            "parameters": params if params is not None else {},
+        }
+    # Upstreams like Minimax only accept function tools, not custom/web_search/etc.
+    return {"type": "function", "function": fn_out}
+
+
+def _sanitize_openai_tools_payload(d: dict) -> None:
+    """Normalize tool definitions for upstream; drop only irrecoverable empty tools; fix tool_calls/function_call."""
+    n_tools_before = 0
+    n_tools_after = 0
+    tools = d.get("tools")
+    if isinstance(tools, list):
+        n_tools_before = len(tools)
+        cleaned = []
+        for t in tools:
+            nt = _normalize_chat_tool_definition(t) if isinstance(t, dict) else None
+            if nt:
+                cleaned.append(nt)
+        if cleaned:
+            d["tools"] = cleaned
+        else:
+            d.pop("tools", None)
+            tc = d.get("tool_choice")
+            if tc not in (None, "none", "auto"):
+                d["tool_choice"] = "none"
+            elif tc == "auto" and n_tools_before > 0:
+                d["tool_choice"] = "none"
+
+    valid_tool_names = set()
+    for t in d.get("tools") or []:
+        if isinstance(t, dict) and isinstance(t.get("function"), dict):
+            n = t["function"].get("name")
+            if isinstance(n, str) and n.strip():
+                valid_tool_names.add(n.strip())
+
+    tc = d.get("tool_choice")
+    if isinstance(tc, dict) and tc.get("type") == "function":
+        fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+        want = (fn.get("name") or "").strip() if isinstance(fn, dict) else ""
+        if want and valid_tool_names and want not in valid_tool_names:
+            d["tool_choice"] = "auto" if valid_tool_names else "none"
+
+    for msg in d.get("messages") or []:
+        if not isinstance(msg, dict):
+            continue
+        tcs = msg.get("tool_calls")
+        if isinstance(tcs, list):
+            kept = []
+            for tc in tcs:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function")
+                if not isinstance(fn, dict):
+                    continue
+                name = _tool_function_name(fn, tc)
+                if not name:
+                    continue
+                fn2 = dict(fn)
+                fn2["name"] = name
+                kept.append({**tc, "function": fn2})
+            if kept:
+                msg["tool_calls"] = kept
+            else:
+                msg.pop("tool_calls", None)
+        fc = msg.get("function_call")
+        if isinstance(fc, dict) and not _tool_function_name(fc, None):
+            msg.pop("function_call", None)
+
+
 def _as_json_bytes(obj) -> bytes:
     return json.dumps(obj).encode("utf-8")
 
@@ -214,11 +392,21 @@ def find_model_in_cache(models_data: dict, model_name: str) -> dict | None:
 
 
 class BaseProvider(ABC):
-    def __init__(self, api_key=None, base_url=None, model_mapping=None, verbose=False):
+    def __init__(
+        self,
+        api_key=None,
+        base_url=None,
+        model_mapping=None,
+        verbose=False,
+        coerce_input_to_messages: bool = False,
+        sanitize_chat_tools: bool = False,
+    ):
         self.api_key = api_key
         self.base_url = base_url
         self.model_mapping = model_mapping or {}
         self.verbose = verbose
+        self.coerce_input_to_messages = coerce_input_to_messages
+        self.sanitize_chat_tools = sanitize_chat_tools
 
     @abstractmethod
     def get_base_url(self) -> str:
@@ -274,6 +462,15 @@ class OpenCodeProvider(BaseProvider):
     def transform_chat_request(self, body: dict) -> dict:
         transformed = dict(body)
         transformed["model"] = self.map_model_name(body.get("model", ""))
+        if self.coerce_input_to_messages:
+            had_nonempty_messages = isinstance(body.get("messages"), list) and len(body["messages"]) > 0
+            msgs = _openai_messages_from_body(body)
+            if msgs:
+                transformed["messages"] = msgs
+            if msgs and not had_nonempty_messages:
+                transformed.pop("input", None)
+        if self.sanitize_chat_tools:
+            _sanitize_openai_tools_payload(transformed)
         return transformed
 
     def transform_generate_request(self, body: dict) -> dict:
@@ -319,7 +516,7 @@ class CustomProvider(BaseProvider):
 
     def transform_chat_request(self, body: dict) -> dict:
         messages = []
-        for msg in body.get("messages", []):
+        for msg in _messages_list_for_chat(body, self.coerce_input_to_messages):
             role = msg.get("role")
             if not role:
                 # Skip messages without a role — silently drop to avoid upstream rejection
@@ -430,7 +627,7 @@ class LMStudioProvider(BaseProvider):
     def transform_chat_request(self, body: dict) -> dict:
         transformed = {
             "model": self.map_model_name(body.get("model", "")),
-            "messages": body.get("messages", []),
+            "messages": _messages_list_for_chat(body, self.coerce_input_to_messages),
             "stream": body.get("stream", False),
         }
         if "options" in body and isinstance(body.get("options"), dict):
@@ -481,6 +678,15 @@ class OllamaPassthroughProvider(BaseProvider):
     def transform_chat_request(self, body: dict) -> dict:
         transformed = dict(body)
         transformed["model"] = self.map_model_name(body.get("model", ""))
+        if self.coerce_input_to_messages:
+            had_nonempty_messages = isinstance(body.get("messages"), list) and len(body["messages"]) > 0
+            msgs = _openai_messages_from_body(body)
+            if msgs:
+                transformed["messages"] = msgs
+            if msgs and not had_nonempty_messages:
+                transformed.pop("input", None)
+        if self.sanitize_chat_tools:
+            _sanitize_openai_tools_payload(transformed)
         return transformed
 
     def transform_generate_request(self, body: dict) -> dict:
@@ -530,6 +736,16 @@ def parse_args():
     )
     parser.add_argument("--timeout", type=int, default=300, help="Upstream timeout seconds (default: 300)")
     parser.add_argument("--passthrough", action="store_true", help="Pass through original body without transformation")
+    parser.add_argument(
+        "--coerce-input-to-messages",
+        action="store_true",
+        help="If messages are missing or empty, build them from Responses-style `input` (needed for some clients such as Cursor).",
+    )
+    parser.add_argument(
+        "--sanitize-chat-tools",
+        action="store_true",
+        help="Normalize tool definitions (e.g. function/custom shape) and tool_calls for strict upstream APIs.",
+    )
 
     parser.add_argument(
         "-v", "--verbose",
@@ -1039,6 +1255,8 @@ def main():
         base_url=args.base_url,
         model_mapping=args.model_mapping,
         verbose=args.verbose,
+        coerce_input_to_messages=args.coerce_input_to_messages,
+        sanitize_chat_tools=args.sanitize_chat_tools,
     )
 
     AIProxyHandler.args = args
