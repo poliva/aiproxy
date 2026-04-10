@@ -71,6 +71,8 @@ python3 aiproxy.py --provider custom --base-url https://api.yourprovider.com/v1 
 | `--model-contexts` | JSON map of per-model context lengths | `{}` |
 | `--timeout` | Upstream request timeout (seconds) | `300` |
 | `--passthrough` | Pass through original body without transformation | `false` |
+| `--coerce-input-to-messages` | Build chat `messages` from Responses-style `input` when `messages` is missing or empty (e.g. Cursor) | `false` |
+| `--sanitize-chat-tools` | Normalize `tools` / `tool_calls` for strict upstreams (e.g. Minimax via OpenCode) | `false` |
 | `--tls` | Enable HTTPS | `false` |
 | `--tls-cert` | Path to TLS certificate (PEM) | - |
 | `--tls-key` | Path to TLS private key (PEM) | - |
@@ -112,6 +114,19 @@ python3 aiproxy.py -v
 ```
 
 This prints detailed logs of incoming requests, headers, bodies, and upstream responses.
+
+### Cursor / strict upstream compatibility
+
+Some clients send OpenAI **Responses**-style bodies (`input` instead of `messages`) or tool definitions that strict providers reject. Enable as needed:
+
+```bash
+python3 aiproxy.py \
+  --coerce-input-to-messages \
+  --sanitize-chat-tools
+```
+
+- **`--coerce-input-to-messages`** — When the request has no `messages` (or an empty list), synthesize them from `input`. Without this flag, the proxy forwards the body unchanged for providers that copy the request (e.g. OpenCode, Ollama passthrough), matching older behavior.
+- **`--sanitize-chat-tools`** — Rewrites `tools` and message `tool_calls` into a conservative OpenAI chat shape (e.g. coerces `type: custom` to `function`, fills empty `parameters`). Used in **OpenCode** and **Ollama passthrough** chat transforms. Omit if your client already sends vanilla `function` tools.
 
 ## Supported Endpoints
 
