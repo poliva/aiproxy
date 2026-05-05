@@ -234,6 +234,35 @@ def _sanitize_openai_tools_payload(d: dict) -> None:
             msg.pop("function_call", None)
 
 
+def _synthesize_missing_reasoning_content_for_tool_calls(messages: list, verbose: bool = False) -> None:
+    """
+    DeepSeek thinking mode requires `reasoning_content` on assistant messages that used tool_calls.
+    Some clients (e.g. GitHub Copilot) replay history with tool_calls but omit streamed reasoning.
+    Mirror visible `content` when present, else empty string, so the upstream request validates.
+    """
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") != "assistant":
+            continue
+        if not msg.get("tool_calls"):
+            continue
+        existing = msg.get("reasoning_content")
+        if isinstance(existing, str) and existing.strip():
+            continue
+        c = msg.get("content")
+        if isinstance(c, str) and c.strip():
+            msg["reasoning_content"] = c
+        else:
+            msg["reasoning_content"] = ""
+        if verbose:
+            print(
+                f"Warning: synthesized reasoning_content for assistant tool_calls message "
+                f"(index {i}); client omitted it (required by DeepSeek thinking mode)",
+                file=sys.stderr,
+            )
+
+
 def _as_json_bytes(obj) -> bytes:
     return json.dumps(obj).encode("utf-8")
 
@@ -471,6 +500,9 @@ class OpenCodeProvider(BaseProvider):
                 transformed.pop("input", None)
         if self.sanitize_chat_tools:
             _sanitize_openai_tools_payload(transformed)
+        msgs = transformed.get("messages")
+        if isinstance(msgs, list):
+            _synthesize_missing_reasoning_content_for_tool_calls(msgs, self.verbose)
         return transformed
 
     def transform_generate_request(self, body: dict) -> dict:
@@ -553,7 +585,12 @@ class CustomProvider(BaseProvider):
             # Preserve function_call (legacy format)
             if msg.get("function_call"):
                 new_msg["function_call"] = msg["function_call"]
+            # DeepSeek thinking mode: assistant reasoning must be echoed on later turns when tool calls occurred
+            if "reasoning_content" in msg:
+                new_msg["reasoning_content"] = msg["reasoning_content"]
             messages.append(new_msg)
+
+        _synthesize_missing_reasoning_content_for_tool_calls(messages, self.verbose)
 
         transformed = {
             "model": self.map_model_name(body.get("model", "")),
@@ -625,9 +662,12 @@ class LMStudioProvider(BaseProvider):
         return self.model_mapping.get(model, model)
 
     def transform_chat_request(self, body: dict) -> dict:
+        messages = _messages_list_for_chat(body, self.coerce_input_to_messages)
+        if isinstance(messages, list):
+            _synthesize_missing_reasoning_content_for_tool_calls(messages, self.verbose)
         transformed = {
             "model": self.map_model_name(body.get("model", "")),
-            "messages": _messages_list_for_chat(body, self.coerce_input_to_messages),
+            "messages": messages,
             "stream": body.get("stream", False),
         }
         if "options" in body and isinstance(body.get("options"), dict):
@@ -687,6 +727,9 @@ class OllamaPassthroughProvider(BaseProvider):
                 transformed.pop("input", None)
         if self.sanitize_chat_tools:
             _sanitize_openai_tools_payload(transformed)
+        msgs = transformed.get("messages")
+        if isinstance(msgs, list):
+            _synthesize_missing_reasoning_content_for_tool_calls(msgs, self.verbose)
         return transformed
 
     def transform_generate_request(self, body: dict) -> dict:
